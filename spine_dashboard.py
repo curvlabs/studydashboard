@@ -113,6 +113,34 @@ def load_and_analyze_csv(file_path):
     
     print(f"✓ Loaded {len(rows)} samples")
     
+    # Chop first and last 5 minutes of data
+    if len(rows) > 0:
+        # Get first and last timestamps (first element of each tuple)
+        timestamps = [row[0] for row in rows]
+        first_timestamp = min(timestamps)
+        last_timestamp = max(timestamps)
+        
+        # 5 minutes in milliseconds
+        FIVE_MINUTES_MS = 5 * 60 * 1000
+        
+        # Calculate cutoff times
+        start_cutoff = first_timestamp + FIVE_MINUTES_MS
+        end_cutoff = last_timestamp - FIVE_MINUTES_MS
+        
+        # Filter rows to exclude first and last 5 minutes
+        original_count = len(rows)
+        rows = [row for row in rows if start_cutoff <= row[0] <= end_cutoff]
+        
+        removed_count = original_count - len(rows)
+        if removed_count > 0:
+            print(f"✓ Removed {removed_count} samples (first/last 5 minutes)")
+            print(f"✓ Remaining {len(rows)} samples")
+        else:
+            print(f"⚠ Warning: Data duration is less than 10 minutes, no data removed")
+    
+    if not rows:
+        return None
+    
     # CRITICAL FIX: Sensors are read sequentially through MUX (3-4ms apart)
     # We need to group by "reading cycle" not exact timestamp
     # A reading cycle is ~30ms window where all sensors are read in sequence
