@@ -788,7 +788,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <h1>🏥 Spine Movement Dashboard</h1>
             <p class="subtitle">Advanced spine analytics powered by medical-grade CurvImu algorithm</p>
             
-            <div class="file-upload" onclick="document.getElementById('csvFile').click()">
+            <div class="file-upload">
                 <label for="csvFile" class="upload-btn">📁 Select CSV Files (Multiple)</label>
                 <input type="file" id="csvFile" accept=".csv" multiple onchange="uploadFiles()">
                 <div id="fileName" style="margin-top: 20px; color: rgba(255,255,255,0.8); font-weight: 700; font-size: 15px; text-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>
