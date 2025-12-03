@@ -89,7 +89,7 @@ def build_spine_from_angles(angles, spacing_cm=9.0):
     return [(x * 100, y * 100) for x, y in locs]
 
 
-def load_and_analyze_csv(file_path):
+def load_and_analyze_csv(file_path, original_filename=None):
     """Load CSV and compute comprehensive metrics"""
     print(f"📂 Loading: {file_path}")
     
@@ -104,7 +104,8 @@ def load_and_analyze_csv(file_path):
                 ax = int(row['Accel_X'])
                 ay = int(row['Accel_Y'])
                 az = int(row['Accel_Z'])
-                rows.append((ts, sid, ax, ay, az))
+                gy = float(row['Gyro_Y'])  # Angular velocity in rad/s
+                rows.append((ts, sid, ax, ay, az, gy))
             except:
                 continue
     
@@ -151,8 +152,10 @@ def load_and_analyze_csv(file_path):
     current_cycle_start_time = None
     CYCLE_WINDOW_MS = 100  # Max time between first and last sensor in a cycle
     
-    for ts, sid, ax, ay, az in rows:
+    for ts, sid, ax, ay, az, gy in rows:
         angle = compute_angle_from_accel(ax, ay, az)
+        # Convert gyroscope from rad/s to deg/s
+        gy_deg_per_sec = gy * 180.0 / math.pi
         
         # Start new cycle if:
         # 1. This is the first reading, OR
@@ -169,11 +172,11 @@ def load_and_analyze_csv(file_path):
                 reading_cycles.append((current_cycle_start_time, dict(current_cycle)))
             
             # Start new cycle
-            current_cycle = {sid: (ts, angle)}
+            current_cycle = {sid: (ts, angle, gy_deg_per_sec)}
             current_cycle_start_time = ts
         else:
             # Add to current cycle
-            current_cycle[sid] = (ts, angle)
+            current_cycle[sid] = (ts, angle, gy_deg_per_sec)
     
     # Don't forget the last cycle
     if current_cycle:
@@ -184,15 +187,15 @@ def load_and_analyze_csv(file_path):
     # Build time_frames from reading cycles
     time_frames = {}
     for cycle_time, cycle_data in reading_cycles:
-        time_frames[cycle_time] = {sid: angle for sid, (ts, angle) in cycle_data.items()}
+        time_frames[cycle_time] = {sid: angle for sid, (ts, angle, gy) in cycle_data.items()}
     
     # Build sensor_data for per-sensor tracking
     sensor_data = defaultdict(list)
     all_sensor_ids = set()
     for cycle_time, cycle_data in reading_cycles:
-        for sid, (ts, angle) in cycle_data.items():
+        for sid, (ts, angle, gy_deg_per_sec) in cycle_data.items():
             all_sensor_ids.add(sid)
-            sensor_data[sid].append({'time': ts/1000.0, 'angle': angle, 'ts_ms': ts})
+            sensor_data[sid].append({'time': ts/1000.0, 'angle': angle, 'ts_ms': ts, 'angular_velocity': abs(gy_deg_per_sec)})
     
     print(f"✓ {len(all_sensor_ids)} sensors detected")
     
@@ -200,7 +203,7 @@ def load_and_analyze_csv(file_path):
     # CRITICAL: Each timestamp represents ONE complete spine position with ALL sensors
     timestamps = sorted(time_frames.keys())
     spine_curves = []
-    sensor_order = sorted(sensor_data.keys())
+    sensor_order = sorted(sensor_data.keys(), reverse=True)
     
     # Sample every 100ms for visualization (reduce data size)
     sampled_timestamps = timestamps[::max(1, len(timestamps)//500)]  # Max 500 frames
@@ -255,6 +258,15 @@ def load_and_analyze_csv(file_path):
     middle_rom = max(middle_angles) - min(middle_angles) if middle_angles else 0
     lower_rom = max(lower_angles) - min(lower_angles) if lower_angles else 0
     
+    # Calculate angular velocity by section
+    upper_angular_velocities = [d['angular_velocity'] for sid in upper for d in sensor_data[sid] if 'angular_velocity' in d]
+    middle_angular_velocities = [d['angular_velocity'] for sid in middle for d in sensor_data[sid] if 'angular_velocity' in d]
+    lower_angular_velocities = [d['angular_velocity'] for sid in lower for d in sensor_data[sid] if 'angular_velocity' in d]
+    
+    upper_angular_velocity = sum(upper_angular_velocities) / len(upper_angular_velocities) if upper_angular_velocities else 0
+    middle_angular_velocity = sum(middle_angular_velocities) / len(middle_angular_velocities) if middle_angular_velocities else 0
+    lower_angular_velocity = sum(lower_angular_velocities) / len(lower_angular_velocities) if lower_angular_velocities else 0
+    
     # Calculate max curvature (max distance from straight line)
     max_curvature = 0
     for curve in spine_curves:
@@ -270,8 +282,11 @@ def load_and_analyze_csv(file_path):
     
     print("✓ Analysis complete")
     
+    # Use original filename if provided, otherwise use file path name
+    display_filename = original_filename if original_filename else Path(file_path).name
+    
     return {
-        'filename': Path(file_path).name,
+        'filename': display_filename,
         'sensors': len(sensor_data),
         'samples': len(rows),
         'duration': duration,
@@ -280,7 +295,9 @@ def load_and_analyze_csv(file_path):
         'middle_rom': middle_rom,
         'lower_rom': lower_rom,
         'avg_angle': sum(all_angles) / len(all_angles) if all_angles else 0,
-        'movement_score': total_rom / duration if duration > 0 else 0,
+        'upper_angular_velocity': upper_angular_velocity,
+        'middle_angular_velocity': middle_angular_velocity,
+        'lower_angular_velocity': lower_angular_velocity,
         'max_curvature': max_curvature,
         'sensor_roms': {str(sid): rom for sid, rom in sensor_roms.items()},
         'spine_curves': spine_curves,
@@ -803,49 +820,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
 
         <div id="dashboard" style="display: none;">
-            <div class="metrics-grid">
-                <div class="metric-card">
-                    <div class="metric-label">⚡ Total ROM</div>
-                    <div class="metric-value"><span id="totalRom">--</span><span class="metric-unit">°</span></div>
-                    <div class="metric-subtitle">Full spine flexibility</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">🔴 Upper Spine</div>
-                    <div class="metric-value"><span id="upperRom">--</span><span class="metric-unit">°</span></div>
-                    <div class="metric-subtitle">Cervical/Upper thoracic</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">🟡 Middle Spine</div>
-                    <div class="metric-value"><span id="middleRom">--</span><span class="metric-unit">°</span></div>
-                    <div class="metric-subtitle">Mid thoracic region</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">🔵 Lower Spine</div>
-                    <div class="metric-value"><span id="lowerRom">--</span><span class="metric-unit">°</span></div>
-                    <div class="metric-subtitle">Lumbar region</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">⏱ Duration</div>
-                    <div class="metric-value"><span id="duration">--</span><span class="metric-unit">s</span></div>
-                    <div class="metric-subtitle" id="durationMin"></div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">📡 Sensors</div>
-                    <div class="metric-value"><span id="sensors">--</span></div>
-                    <div class="metric-subtitle"><span id="samples">--</span> samples</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">🎯 Movement Score</div>
-                    <div class="metric-value"><span id="score">--</span><span class="metric-unit">°/s</span></div>
-                    <div class="metric-subtitle" id="activityLevel"></div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">📏 Max Curvature</div>
-                    <div class="metric-value"><span id="curvature">--</span><span class="metric-unit">cm</span></div>
-                    <div class="metric-subtitle">Peak spine bend</div>
-                </div>
-            </div>
-
             <!-- Spine Visualization -->
             <div class="spine-viz-container">
                 <div class="chart-title"><span class="chart-icon">🦴</span> Live Spine Visualization</div>
@@ -877,20 +851,55 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </p>
             </div>
 
-            <div class="charts-grid">
-                <div class="chart-card">
-                    <div class="chart-title"><span class="chart-icon">📊</span> ROM Distribution</div>
-                    <div id="romChart" style="height: 320px;"></div>
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-label">🔴 Upper Spine</div>
+                    <div class="metric-value"><span id="upperRom">--</span><span class="metric-unit">°</span></div>
+                    <div class="metric-subtitle">Cervical/Upper thoracic</div>
                 </div>
-                <div class="chart-card">
-                    <div class="chart-title"><span class="chart-icon">📈</span> Angles Over Time</div>
-                    <div id="timeChart" style="height: 320px;"></div>
+                <div class="metric-card">
+                    <div class="metric-label">🟡 Middle Spine</div>
+                    <div class="metric-value"><span id="middleRom">--</span><span class="metric-unit">°</span></div>
+                    <div class="metric-subtitle">Mid thoracic region</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">🔵 Lower Spine</div>
+                    <div class="metric-value"><span id="lowerRom">--</span><span class="metric-unit">°</span></div>
+                    <div class="metric-subtitle">Lumbar region</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">⏱ Duration</div>
+                    <div class="metric-value"><span id="duration">--</span></div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">📡 Sensors</div>
+                    <div class="metric-value"><span id="sensors">--</span></div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">📊 Samples</div>
+                    <div class="metric-value"><span id="samples">--</span></div>
+                    <div class="metric-subtitle">Total readings</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">🔄 Upper Angular Velocity</div>
+                    <div class="metric-value"><span id="upperAngVel">--</span><span class="metric-unit">°/s</span></div>
+                    <div class="metric-subtitle">Cervical/Upper thoracic</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">🔄 Middle Angular Velocity</div>
+                    <div class="metric-value"><span id="middleAngVel">--</span><span class="metric-unit">°/s</span></div>
+                    <div class="metric-subtitle">Mid thoracic region</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">🔄 Lower Angular Velocity</div>
+                    <div class="metric-value"><span id="lowerAngVel">--</span><span class="metric-unit">°/s</span></div>
+                    <div class="metric-subtitle">Lumbar region</div>
                 </div>
             </div>
 
             <div class="chart-card">
-                <div class="chart-title"><span class="chart-icon">🎯</span> Per-Sensor ROM Analysis</div>
-                <div id="sensorChart" style="height: 350px;"></div>
+                <div class="chart-title"><span class="chart-icon">📊</span> ROM Distribution</div>
+                <div id="romChart" style="height: 320px;"></div>
             </div>
         </div>
     </div>
@@ -903,6 +912,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let currentFrame = 0;
         let isPlaying = false;
         let playbackSpeed = 1.0;
+        let fixedAxisRange = null;  // Fixed axis ranges for live visualization
+
+        function formatDuration(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            if (hours > 0) {
+                return `${hours}h ${minutes}m`;
+            } else {
+                return `${minutes}m`;
+            }
+        }
 
         async function uploadFiles() {
             console.log('📁 uploadFiles() called');
@@ -917,7 +937,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
-            document.getElementById('fileName').textContent = `📄 ${files.length} file(s) selected`;
+            // fileName will be updated after files are processed
             document.getElementById('loading').style.display = 'block';
             
             allDatasets = [];  // Reset datasets
@@ -955,6 +975,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 // Display file list
                 displayFileList();
                 
+                // Update filename display
+                if (allDatasets.length === 1) {
+                    document.getElementById('fileName').textContent = `📄 ${allDatasets[0].filename}`;
+                } else {
+                    const filenames = allDatasets.map(d => d.filename).join(', ');
+                    document.getElementById('fileName').textContent = `📄 ${filenames}`;
+                }
+                
                 // Show comparison or single view
                 if (allDatasets.length > 1) {
                     displayComparison();
@@ -983,7 +1011,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 item.innerHTML = `
                     <div>
                         <div class="file-name">${data.filename}</div>
-                        <div class="file-metrics">${data.duration.toFixed(0)}s • ${data.total_rom.toFixed(1)}° ROM • ${data.sensors} sensors</div>
+                        <div class="file-metrics">${data.duration.toFixed(0)}s • ${data.total_rom.toFixed(0)}° ROM • ${data.sensors} sensors</div>
                     </div>
                     <button class="comparison-toggle" onclick="event.stopPropagation(); selectDataset(${idx})">View</button>
                 `;
@@ -1006,6 +1034,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         function selectDataset(idx) {
             currentDatasetIndex = idx;
             currentData = allDatasets[idx];
+            document.getElementById('fileName').textContent = `📄 ${currentData.filename}`;
             displayResults(currentData);
             displayFileList();  // Refresh to update selected state
         }
@@ -1018,6 +1047,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
             
+            // Update filename display for comparison
+            const filenames = allDatasets.map(d => d.filename).join(', ');
+            document.getElementById('fileName').textContent = `📄 ${filenames}`;
+            
             document.getElementById('dashboard').style.display = 'block';
             
             // Show aggregated metrics
@@ -1028,20 +1061,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const totalDuration = allDatasets.reduce((sum, d) => sum + d.duration, 0);
             const totalSamples = allDatasets.reduce((sum, d) => sum + d.samples, 0);
             
-            document.getElementById('totalRom').textContent = avgROM.toFixed(1);
-            document.getElementById('upperRom').textContent = avgUpper.toFixed(1);
-            document.getElementById('middleRom').textContent = avgMiddle.toFixed(1);
-            document.getElementById('lowerRom').textContent = avgLower.toFixed(1);
-            document.getElementById('duration').textContent = totalDuration.toFixed(1);
-            document.getElementById('durationMin').textContent = (totalDuration / 60).toFixed(1) + ' minutes total';
+            document.getElementById('upperRom').textContent = avgUpper.toFixed(0);
+            document.getElementById('middleRom').textContent = avgMiddle.toFixed(0);
+            document.getElementById('lowerRom').textContent = avgLower.toFixed(0);
+            document.getElementById('duration').textContent = formatDuration(totalDuration);
             document.getElementById('sensors').textContent = allDatasets[0].sensors;
             document.getElementById('samples').textContent = totalSamples.toLocaleString();
-            document.getElementById('score').textContent = (avgROM / (totalDuration / allDatasets.length)).toFixed(2);
-            document.getElementById('curvature').textContent = (allDatasets.reduce((sum, d) => sum + d.max_curvature, 0) / allDatasets.length).toFixed(2);
-            document.getElementById('activityLevel').textContent = `Avg across ${allDatasets.length} sessions`;
+            
+            // Calculate average angular velocities across datasets
+            const avgUpperAngVel = allDatasets.reduce((sum, d) => sum + d.upper_angular_velocity, 0) / allDatasets.length;
+            const avgMiddleAngVel = allDatasets.reduce((sum, d) => sum + d.middle_angular_velocity, 0) / allDatasets.length;
+            const avgLowerAngVel = allDatasets.reduce((sum, d) => sum + d.lower_angular_velocity, 0) / allDatasets.length;
+            
+            document.getElementById('upperAngVel').textContent = avgUpperAngVel.toFixed(0);
+            document.getElementById('middleAngVel').textContent = avgMiddleAngVel.toFixed(0);
+            document.getElementById('lowerAngVel').textContent = avgLowerAngVel.toFixed(0);
             
             // ROM comparison trend
             const sessionNames = allDatasets.map((d, i) => d.filename);
+            const allRomValues = [
+                ...allDatasets.map(d => d.upper_rom),
+                ...allDatasets.map(d => d.middle_rom),
+                ...allDatasets.map(d => d.lower_rom)
+            ];
+            const maxRom = Math.max(...allRomValues);
+            const yAxisMax = maxRom * 1.1; // Add 10% padding for grouped bars
+            
             Plotly.newPlot('romChart', [
                 {
                     x: sessionNames,
@@ -1065,15 +1110,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     marker: { color: '#ec4899' }
                 }
             ], {
-                margin: { t: 30, b: 100, l: 60, r: 20 },
+                margin: { t: 30, b: 100, l: 60, r: 10 },
                 yaxis: { 
                     title: 'ROM (°)',
                     gridcolor: 'rgba(255,255,255,0.08)',
-                    color: 'rgba(255,255,255,0.7)'
+                    color: 'rgba(255,255,255,0.7)',
+                    range: [0, yAxisMax],
+                    fixedrange: true
                 },
                 xaxis: { 
                     tickangle: -45,
-                    color: 'rgba(255,255,255,0.7)'
+                    color: 'rgba(255,255,255,0.7)',
+                    fixedrange: true
                 },
                 barmode: 'group',
                 plot_bgcolor: 'rgba(0,0,0,0)',
@@ -1084,67 +1132,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     bordercolor: 'rgba(255,255,255,0.1)',
                     font: { color: '#ffffff' }
                 }
-            }, {responsive: true, displayModeBar: false});
-            
-            // Total ROM trend
-            Plotly.newPlot('timeChart', [{
-                x: sessionNames,
-                y: allDatasets.map(d => d.total_rom),
-                type: 'scatter',
-                mode: 'lines+markers',
-                line: { color: '#8b5cf6', width: 3 },
-                marker: { size: 12, color: '#ec4899', line: { color: '#ffffff', width: 2 } },
-                name: 'Total ROM Trend'
-            }], {
-                margin: { t: 30, b: 100, l: 60, r: 20 },
-                yaxis: { 
-                    title: 'Total ROM (°)',
-                    gridcolor: 'rgba(255,255,255,0.08)',
-                    color: 'rgba(255,255,255,0.7)'
-                },
-                xaxis: { 
-                    tickangle: -45,
-                    color: 'rgba(255,255,255,0.7)'
-                },
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                font: { family: 'Inter', color: 'rgba(255,255,255,0.7)' }
-            }, {responsive: true, displayModeBar: false});
-            
-            // Movement score comparison
-            Plotly.newPlot('sensorChart', [{
-                x: sessionNames,
-                y: allDatasets.map(d => d.movement_score),
-                type: 'bar',
-                marker: {
-                    color: allDatasets.map(d => d.movement_score),
-                    colorscale: [[0, '#3b82f6'], [0.5, '#8b5cf6'], [1, '#ec4899']],
-                    showscale: true,
-                    colorbar: {
-                        title: 'Score',
-                        titlefont: { color: '#ffffff' },
-                        tickfont: { color: '#ffffff' },
-                        bgcolor: 'rgba(0,0,0,0.5)',
-                        bordercolor: 'rgba(255,255,255,0.1)'
-                    }
-                },
-                text: allDatasets.map(d => d.movement_score.toFixed(2)),
-                textposition: 'outside',
-                textfont: { color: '#ffffff', family: 'Inter', weight: 'bold' }
-            }], {
-                margin: { t: 30, b: 100, l: 60, r: 100 },
-                yaxis: { 
-                    title: 'Movement Score (°/s)',
-                    gridcolor: 'rgba(255,255,255,0.08)',
-                    color: 'rgba(255,255,255,0.7)'
-                },
-                xaxis: { 
-                    tickangle: -45,
-                    color: 'rgba(255,255,255,0.7)'
-                },
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                font: { family: 'Inter', color: 'rgba(255,255,255,0.7)' }
             }, {responsive: true, displayModeBar: false});
             
             // Update titles for comparison view
@@ -1184,7 +1171,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             color: colors[idx % colors.length],
                             line: { color: 'rgba(255,255,255,0.4)', width: 3 }
                         },
-                        hovertemplate: `<b>${data.filename}</b><br>(%{x:.1f}, %{y:.1f}) cm<extra></extra>`
+                        hovertemplate: `<b>${data.filename}</b><br>(%{x:.0f}, %{y:.0f}) cm<extra></extra>`
                     });
                 }
             });
@@ -1208,7 +1195,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     color: 'rgba(255,255,255,0.7)',
                     zeroline: true,
                     zerolinecolor: 'rgba(255,255,255,0.2)',
-                    zerolinewidth: 2
+                    zerolinewidth: 2,
+                    fixedrange: true
                 },
                 yaxis: { 
                     title: 'Vertical (cm)', 
@@ -1218,7 +1206,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     color: 'rgba(255,255,255,0.7)',
                     zeroline: true,
                     zerolinecolor: 'rgba(255,255,255,0.2)',
-                    zerolinewidth: 2
+                    zerolinewidth: 2,
+                    fixedrange: true
                 },
                 plot_bgcolor: 'rgba(0,0,0,0)',
                 paper_bgcolor: 'rgba(0,0,0,0)',
@@ -1261,140 +1250,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             // Update metrics
             console.log('   Updating metrics...');
-            document.getElementById('totalRom').textContent = data.total_rom.toFixed(1);
-            document.getElementById('upperRom').textContent = data.upper_rom.toFixed(1);
-            document.getElementById('middleRom').textContent = data.middle_rom.toFixed(1);
-            document.getElementById('lowerRom').textContent = data.lower_rom.toFixed(1);
-            document.getElementById('duration').textContent = data.duration.toFixed(1);
-            document.getElementById('durationMin').textContent = (data.duration / 60).toFixed(1) + ' minutes';
+            document.getElementById('upperRom').textContent = data.upper_rom.toFixed(0);
+            document.getElementById('middleRom').textContent = data.middle_rom.toFixed(0);
+            document.getElementById('lowerRom').textContent = data.lower_rom.toFixed(0);
+            document.getElementById('duration').textContent = formatDuration(data.duration);
             document.getElementById('sensors').textContent = data.sensors;
-            document.getElementById('score').textContent = data.movement_score.toFixed(2);
+            document.getElementById('upperAngVel').textContent = data.upper_angular_velocity.toFixed(0);
+            document.getElementById('middleAngVel').textContent = data.middle_angular_velocity.toFixed(0);
+            document.getElementById('lowerAngVel').textContent = data.lower_angular_velocity.toFixed(0);
             document.getElementById('samples').textContent = data.samples.toLocaleString();
-            document.getElementById('curvature').textContent = data.max_curvature.toFixed(2);
-            
-            // Activity level
-            const score = data.movement_score;
-            let activityLevel = score > 5 ? 'High activity' : (score > 2 ? 'Moderate' : 'Low activity');
-            document.getElementById('activityLevel').textContent = activityLevel;
 
             // ROM Distribution Chart
+            const romValues = [data.upper_rom, data.middle_rom, data.lower_rom];
+            const maxRom = Math.max(...romValues);
+            // Add 20% padding above max value to ensure labels fit
+            const yAxisMax = maxRom * 1.2;
+            
             Plotly.newPlot('romChart', [{
                 x: ['Upper', 'Middle', 'Lower'],
-                y: [data.upper_rom, data.middle_rom, data.lower_rom],
+                y: romValues,
                 type: 'bar',
                 marker: {
                     color: ['#3b82f6', '#8b5cf6', '#ec4899'],
                     line: { color: 'rgba(255,255,255,0.2)', width: 2 }
                 },
-                text: [data.upper_rom.toFixed(1) + '°', data.middle_rom.toFixed(1) + '°', data.lower_rom.toFixed(1) + '°'],
+                text: [data.upper_rom.toFixed(0) + '°', data.middle_rom.toFixed(0) + '°', data.lower_rom.toFixed(0) + '°'],
                 textposition: 'outside',
                 textfont: { size: 14, family: 'Inter', weight: 'bold', color: '#ffffff' }
             }], {
-                margin: { t: 30, b: 50, l: 60, r: 20 },
+                margin: { t: 60, b: 50, l: 60, r: 50 },
                 yaxis: { 
                     title: 'Range of Motion (°)', 
                     gridcolor: 'rgba(255,255,255,0.08)',
                     color: 'rgba(255,255,255,0.7)',
-                    zerolinecolor: 'rgba(255,255,255,0.1)'
-                },
-                xaxis: { color: 'rgba(255,255,255,0.7)' },
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                font: { family: 'Inter', color: 'rgba(255,255,255,0.7)' }
-            }, {responsive: true, displayModeBar: false});
-
-            // Time series chart (per sensor)
-            const traces = [];
-            const colors = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#06b6d4', '#6366f1', '#ef4444'];
-            
-            for (let i = 0; i < data.sensor_order.length; i++) {
-                const sid = data.sensor_order[i];
-                const points = data.sensor_roms[sid] ? (data.spine_curves.map(c => ({
-                    time: c.time,
-                    angle: c.angles[i]
-                })).filter(p => p.angle !== undefined)) : [];
-                
-                if (points.length > 0) {
-                    // Sample down to max 500 points for performance
-                    const step = Math.max(1, Math.floor(points.length / 500));
-                    const sampled = points.filter((_, idx) => idx % step === 0);
-                    
-                    traces.push({
-                        x: sampled.map(p => p.time),
-                        y: sampled.map(p => p.angle),
-                        type: 'scatter',
-                        mode: 'lines',
-                        name: 'Sensor ' + sid,
-                        line: { color: colors[i % colors.length], width: 2.5 }
-                    });
-                }
-            }
-
-            Plotly.newPlot('timeChart', traces, {
-                margin: { t: 20, b: 50, l: 60, r: 20 },
-                xaxis: { 
-                    title: 'Time (s)', 
-                    gridcolor: 'rgba(255,255,255,0.08)',
-                    color: 'rgba(255,255,255,0.7)',
-                    zerolinecolor: 'rgba(255,255,255,0.1)'
-                },
-                yaxis: { 
-                    title: 'Angle (°)', 
-                    gridcolor: 'rgba(255,255,255,0.08)',
-                    color: 'rgba(255,255,255,0.7)',
-                    zerolinecolor: 'rgba(255,255,255,0.1)'
-                },
-                showlegend: true,
-                legend: { 
-                    x: 1, 
-                    xanchor: 'right', 
-                    y: 1,
-                    bgcolor: 'rgba(0,0,0,0.5)',
-                    bordercolor: 'rgba(255,255,255,0.1)',
-                    borderwidth: 1,
-                    font: { color: '#ffffff' }
-                },
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                font: { family: 'Inter', color: 'rgba(255,255,255,0.7)' }
-            }, {responsive: true, displayModeBar: false});
-
-            // Sensor ROM chart
-            const sensorIds = data.sensor_order;
-            const sensorRomValues = sensorIds.map(sid => data.sensor_roms[sid]);
-            
-            Plotly.newPlot('sensorChart', [{
-                x: sensorIds.map(s => 'Sensor ' + s),
-                y: sensorRomValues,
-                type: 'bar',
-                marker: {
-                    color: sensorRomValues,
-                    colorscale: [[0, '#3b82f6'], [0.5, '#8b5cf6'], [1, '#ec4899']],
-                    showscale: true,
-                    colorbar: { 
-                        title: 'ROM (°)',
-                        titlefont: { color: '#ffffff' },
-                        tickfont: { color: '#ffffff' },
-                        bgcolor: 'rgba(0,0,0,0.5)',
-                        bordercolor: 'rgba(255,255,255,0.1)',
-                        borderwidth: 1
-                    },
-                    line: { color: 'rgba(255,255,255,0.2)', width: 2 }
-                },
-                text: sensorRomValues.map(v => v.toFixed(1) + '°'),
-                textposition: 'outside',
-                textfont: { size: 13, family: 'Inter', weight: 'bold', color: '#ffffff' }
-            }], {
-                margin: { t: 30, b: 70, l: 60, r: 100 },
-                yaxis: { 
-                    title: 'ROM (degrees)',
-                    gridcolor: 'rgba(255,255,255,0.08)',
-                    color: 'rgba(255,255,255,0.7)',
-                    zerolinecolor: 'rgba(255,255,255,0.1)'
+                    zerolinecolor: 'rgba(255,255,255,0.1)',
+                    range: [0, yAxisMax],
+                    fixedrange: true
                 },
                 xaxis: { 
-                    tickangle: -45,
-                    color: 'rgba(255,255,255,0.7)'
+                    color: 'rgba(255,255,255,0.7)',
+                    fixedrange: true
                 },
                 plot_bgcolor: 'rgba(0,0,0,0)',
                 paper_bgcolor: 'rgba(0,0,0,0)',
@@ -1410,6 +1305,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (data.spine_curves.length > 0) {
                 console.log('   Spine curves available:', data.spine_curves.length);
                 document.getElementById('timeSlider').max = data.spine_curves.length - 1;
+                
+                // Calculate fixed axis ranges across all frames
+                let allX = [];
+                let allY = [];
+                data.spine_curves.forEach(curve => {
+                    if (curve.points && curve.points.length > 0) {
+                        curve.points.forEach(p => {
+                            allX.push(p[0]);
+                            allY.push(p[1]);
+                        });
+                    }
+                });
+                
+                if (allX.length > 0 && allY.length > 0) {
+                    const padding = 10;
+                    fixedAxisRange = {
+                        x: [Math.min(...allX) - padding, Math.max(...allX) + padding],
+                        y: [Math.min(...allY) - padding, Math.max(...allY) + padding]
+                    };
+                }
+                
                 drawSpineFrame(0);
             }
             
@@ -1450,7 +1366,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         symbol: 'circle'
                     },
                     text: x.map((_, i) => `Sensor ${i+1}`),
-                    hovertemplate: '%{text}<br>Position: (%{x:.1f}, %{y:.1f}) cm<extra></extra>',
+                    hovertemplate: '%{text}<br>Position: (%{x:.0f}, %{y:.0f}) cm<extra></extra>',
                     name: 'Average Position'
                 },
                 {
@@ -1479,14 +1395,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     zeroline: true,
                     zerolinecolor: 'rgba(255,255,255,0.2)',
                     zerolinewidth: 2,
-                    color: 'rgba(255,255,255,0.7)'
+                    color: 'rgba(255,255,255,0.7)',
+                    fixedrange: true
                 },
                 yaxis: { 
                     title: 'Vertical (cm)', 
                     gridcolor: 'rgba(255,255,255,0.05)',
                     scaleanchor: 'x',
                     scaleratio: 1,
-                    color: 'rgba(255,255,255,0.7)'
+                    color: 'rgba(255,255,255,0.7)',
+                    fixedrange: true
                 },
                 plot_bgcolor: 'rgba(0,0,0,0)',
                 paper_bgcolor: 'rgba(0,0,0,0)',
@@ -1546,13 +1464,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         line: { color: 'rgba(255,255,255,0.4)', width: 3 },
                         symbol: 'circle'
                     },
-                    text: x.map((_, i) => `<b>Sensor ${i+1}</b><br>Angle: ${curve.angles[i].toFixed(1)}°<br>Position: (${x[i].toFixed(1)}, ${y[i].toFixed(1)}) cm`),
+                    text: x.map((_, i) => `<b>Sensor ${i+1}</b><br>Angle: ${curve.angles[i].toFixed(0)}°<br>Position: (${x[i].toFixed(0)}, ${y[i].toFixed(0)}) cm`),
                     hovertemplate: '%{text}<extra></extra>',
                     name: 'Sensors'
                 },
                 {
                     x: [0, 0],
-                    y: [Math.min(...y) - 10, Math.max(...y) + 10],
+                    y: fixedAxisRange ? fixedAxisRange.y : [Math.min(...y) - 10, Math.max(...y) + 10],
                     type: 'scatter',
                     mode: 'lines',
                     line: { color: 'rgba(255,255,255,0.15)', width: 2, dash: 'dash' },
@@ -1560,7 +1478,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     hoverinfo: 'skip'
                 },
                 {
-                    x: [Math.min(...x) - 10, Math.max(...x) + 10],
+                    x: fixedAxisRange ? fixedAxisRange.x : [Math.min(...x) - 10, Math.max(...x) + 10],
                     y: [0, 0],
                     type: 'scatter',
                     mode: 'lines',
@@ -1573,20 +1491,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 xaxis: { 
                     title: 'Lateral (cm)', 
                     gridcolor: 'rgba(255,255,255,0.05)',
-                    range: [Math.min(...x) - 10, Math.max(...x) + 10],
+                    range: fixedAxisRange ? fixedAxisRange.x : [Math.min(...x) - 10, Math.max(...x) + 10],
                     color: 'rgba(255,255,255,0.7)',
                     zerolinecolor: 'rgba(255,255,255,0.2)',
-                    zerolinewidth: 2
+                    zerolinewidth: 2,
+                    fixedrange: true
                 },
                 yaxis: { 
                     title: 'Vertical (cm)', 
                     gridcolor: 'rgba(255,255,255,0.05)',
                     scaleanchor: 'x',
                     scaleratio: 1,
-                    range: [Math.min(...y) - 10, Math.max(...y) + 10],
+                    range: fixedAxisRange ? fixedAxisRange.y : [Math.min(...y) - 10, Math.max(...y) + 10],
                     color: 'rgba(255,255,255,0.7)',
                     zerolinecolor: 'rgba(255,255,255,0.2)',
-                    zerolinewidth: 2
+                    zerolinewidth: 2,
+                    fixedrange: true
                 },
                 plot_bgcolor: 'rgba(0,0,0,0)',
                 paper_bgcolor: 'rgba(0,0,0,0)',
@@ -1597,7 +1517,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             // Update time display
             const totalTime = currentData.spine_curves[currentData.spine_curves.length - 1].time;
             document.getElementById('timeDisplay').textContent = 
-                `${curve.time.toFixed(1)}s / ${totalTime.toFixed(1)}s`;
+                `${curve.time.toFixed(0)}s / ${totalTime.toFixed(0)}s`;
         }
 
         function togglePlayback() {
@@ -1688,6 +1608,22 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     if b'filename=' in part:
                         print(f"   Processing part {idx} with filename")
                         
+                        # Extract original filename from multipart header
+                        original_filename = None
+                        header_lines = part.split(b'\r\n\r\n', 1)[0].split(b'\r\n')
+                        for header_line in header_lines:
+                            if b'filename=' in header_line:
+                                # Extract filename from: Content-Disposition: form-data; name="file"; filename="original.csv"
+                                try:
+                                    filename_part = header_line.decode('utf-8', errors='ignore')
+                                    if 'filename="' in filename_part:
+                                        original_filename = filename_part.split('filename="')[1].split('"')[0]
+                                    elif "filename='" in filename_part:
+                                        original_filename = filename_part.split("filename='")[1].split("'")[0]
+                                    print(f"   Extracted filename: {original_filename}")
+                                except:
+                                    pass
+                        
                         # Extract CSV content
                         csv_content = part.split(b'\r\n\r\n', 1)[1]
                         csv_content = csv_content.rsplit(b'\r\n', 1)[0]
@@ -1703,7 +1639,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         print("   🔬 Starting analysis...")
                         
                         # Analyze
-                        result = load_and_analyze_csv(temp_path)
+                        result = load_and_analyze_csv(temp_path, original_filename)
                         
                         if result:
                             print("   ✅ Analysis successful!")
